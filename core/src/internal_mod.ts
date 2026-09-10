@@ -84,6 +84,7 @@ export { Empty } from "./types.ts";
 export { extractProtocolMessage, protoLen } from "./transport.ts";
 
 export type {
+  AsyncAuthenticator,
   Auth,
   Authenticator,
   CallbackFn,

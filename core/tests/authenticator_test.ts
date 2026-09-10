@@ -33,7 +33,7 @@ import type {
   NatsConnectionImpl,
 } from "../src/internal_mod.ts";
 
-import { assertEquals, assertThrows } from "@std/assert";
+import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import {
   encodeAccount,
   encodeOperator,
@@ -263,4 +263,91 @@ Deno.test("authenticator - bad creds", () => {
     Error,
     "unable to parse credentials",
   );
+});
+
+// Mirrors nkeyAuthenticator's own signing logic (authenticator.ts) rather
+// than reusing it directly, wrapped with a real delay — proves this is a
+// genuinely asynchronous authenticator settling later, not a Promise that
+// happens to resolve synchronously on the same microtask.
+function delayedNkeyAsyncAuthenticator(
+  seed: Uint8Array,
+  delayMs: number,
+): (nonce?: string) => Promise<Auth> {
+  return async (nonce?: string): Promise<Auth> => {
+    await delay(delayMs);
+    const kp = nkeys.fromSeed(seed);
+    const nkey = kp.getPublicKey();
+    const challenge = new TextEncoder().encode(nonce || "");
+    const sig = nkeys.encode(kp.sign(challenge));
+    return { nkey, sig };
+  };
+}
+
+Deno.test("authenticator - async fn", async () => {
+  const user = nkeys.createUser();
+  const seed = user.getSeed();
+  const nkey = user.getPublicKey();
+
+  const { ns, nc } = await setup({
+    authorization: {
+      users: [{ nkey }],
+    },
+  }, {
+    asyncAuthenticator: delayedNkeyAsyncAuthenticator(seed, 250),
+  });
+
+  await nc.flush();
+  assertEquals(nc.isClosed(), false);
+  await cleanup(ns, nc);
+});
+
+Deno.test("authenticator - async fn rejects", async () => {
+  const asyncAuthenticator = (_nonce?: string): Promise<Auth> => {
+    return Promise.reject(new Error("async authenticator blew up"));
+  };
+
+  await assertRejects(
+    async () => {
+      await setup({}, { asyncAuthenticator, reconnect: false });
+    },
+    Error,
+  );
+});
+
+// This is the test that actually proves the awaitingAsyncConnect gate in
+// ProtocolHandler.push() works, not just that the code compiles. It uses a
+// very short server-side ping_interval against an authenticator delay long
+// enough that the real nats-server (confirmed via its own source,
+// server.go: "Set the Ping timer. Will be reset once connect was received")
+// will send at least one unsolicited PING before this client's CONNECT is
+// sent. If the gate didn't work — if that early PING were dispatched to
+// processPing() and a PONG were written to a transport that hasn't sent
+// CONNECT yet — this would either fail outright or leave the connection in
+// a bad state. Success here means the race was hit and handled correctly,
+// not that the race never happened.
+Deno.test("authenticator - async fn ignores data before connect", async () => {
+  const user = nkeys.createUser();
+  const seed = user.getSeed();
+  const nkey = user.getPublicKey();
+
+  const { ns, nc } = await setup({
+    authorization: {
+      users: [{ nkey }],
+    },
+    // Aggressive on purpose — short enough that the server's ping timer
+    // (armed immediately after INFO, per server.go) fires well within the
+    // authenticator's artificial delay below. ping_max raised generously so
+    // the several unanswered pings this produces (we're not able to PONG
+    // until the gate opens) don't also trip the server's own unrelated
+    // stale-connection detection — that's a real, separate server defense,
+    // not what this test is isolating.
+    ping_interval: "50ms",
+    ping_max: 50,
+  }, {
+    asyncAuthenticator: delayedNkeyAsyncAuthenticator(seed, 500),
+  });
+
+  await nc.flush();
+  assertEquals(nc.isClosed(), false);
+  await cleanup(ns, nc);
 });

@@ -869,6 +869,20 @@ export interface Authenticator {
   (nonce?: string): Auth;
 }
 
+/**
+ * AsyncAuthenticator is like {@link Authenticator}, but for credential
+ * schemes that cannot compute their result synchronously — for example,
+ * signing the connection nonce with a non-extractable WebCrypto key, which
+ * is asynchronous on every browser by specification. Mutually exclusive
+ * with {@link Authenticator} in practice: if set, it takes precedence for
+ * the initial CONNECT, and the existing synchronous {@link Authenticator}
+ * path is otherwise unaffected by its presence.
+ * @type function(nonce?: string) => Promise<Auth>
+ */
+export interface AsyncAuthenticator {
+  (nonce?: string): Promise<Auth>;
+}
+
 export interface ConnectionOptions {
   /**
    * When the server requires authentication, set an {@link Authenticator}.
@@ -877,6 +891,16 @@ export interface ConnectionOptions {
    * if {@link user} and {@link pass} or the {@link token} options are set.
    */
   authenticator?: Authenticator | Authenticator[];
+  /**
+   * Like {@link authenticator}, but for a credential scheme that can only
+   * compute its result asynchronously (e.g. signing with a non-extractable
+   * WebCrypto key). When set, this is used instead of {@link authenticator}
+   * for the initial CONNECT; while it is resolving, any protocol messages
+   * the server sends are deliberately ignored, since this connection has
+   * not yet sent its own CONNECT and nothing arriving in that window should
+   * be acted on.
+   */
+  asyncAuthenticator?: AsyncAuthenticator;
   /**
    * When set to `true` the client will print protocol messages that it receives
    * or sends to the server.

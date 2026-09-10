@@ -57,6 +57,7 @@ export {
 } from "./internal_mod.ts";
 
 export type {
+  AsyncAuthenticator,
   Auth,
   Authenticator,
   Backoff,
