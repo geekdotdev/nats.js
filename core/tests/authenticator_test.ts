@@ -13,9 +13,10 @@
  * limitations under the License.
  */
 
-import { cleanup, setup } from "nst";
+import { cleanup, NatsServer, setup } from "nst";
 
 import {
+  AuthorizationError,
   credsAuthenticator,
   deadline,
   deferred,
@@ -33,7 +34,16 @@ import type {
   NatsConnectionImpl,
 } from "../src/internal_mod.ts";
 
-import { assertEquals, assertRejects, assertThrows } from "@std/assert";
+import {
+  assertEquals,
+  assertInstanceOf,
+  assertRejects,
+  assertThrows,
+} from "@std/assert";
+import { createServer } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
+import type { Buffer } from "node:buffer";
+import { connect } from "./connect.ts";
 import {
   encodeAccount,
   encodeOperator,
@@ -350,4 +360,139 @@ Deno.test("authenticator - async fn ignores data before connect", async () => {
   await nc.flush();
   assertEquals(nc.isClosed(), false);
   await cleanup(ns, nc);
+});
+
+// A server that sends INFO (with a nonce) and a PING, then an -ERR after
+// `afterMs`, and leaves the socket open, recording every CONNECT it receives.
+// Leaving the socket open isolates what the client does on its own: with a
+// real server the socket closing would end the attempt regardless.
+async function errServer(err: string, afterMs: number) {
+  const connects: string[] = [];
+  const sockets: Socket[] = [];
+  const server = createServer((sock) => {
+    sockets.push(sock);
+    sock.on("error", () => {});
+    sock.on("data", (b: Buffer) => {
+      for (const line of b.toString().split("\r\n")) {
+        if (line.startsWith("CONNECT ")) {
+          connects.push(line);
+        }
+      }
+    });
+    const info = JSON.stringify({
+      server_id: "SCRIPTED",
+      version: "2.10.0",
+      host: "127.0.0.1",
+      port: 0,
+      headers: true,
+      nonce: "n",
+    });
+    sock.write(`INFO ${info}\r\nPING\r\n`);
+    setTimeout(() => sock.write(`-ERR '${err}'\r\n`), afterMs);
+  });
+  const ready = deferred<void>();
+  let port = 0;
+  server.listen(0, "127.0.0.1", () => {
+    port = (server.address() as AddressInfo).port;
+    ready.resolve();
+  });
+  await ready;
+  return {
+    port,
+    connects,
+    async stop() {
+      sockets.forEach((s) => s.destroy());
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}
+
+// The server gives up on a connection that is still waiting for its
+// authenticator. The -ERR must be handled immediately - not dropped with the
+// rest of the pre-CONNECT traffic, which would leave connect() waiting for
+// the dial timeout and lose the server's explanation.
+Deno.test("authenticator - async fn: server -ERR preempts a pending authenticator", async () => {
+  const release = deferred<void>();
+  const srv = await errServer("Authentication Timeout", 100);
+  try {
+    let signed = false;
+    const started = Date.now();
+    const err = await assertRejects(() =>
+      connect({
+        port: srv.port,
+        reconnect: false,
+        asyncAuthenticator: async () => {
+          await release;
+          signed = true;
+          return { auth_token: "x" };
+        },
+      })
+    );
+    assertInstanceOf(err, AuthorizationError);
+    assertEquals(signed, false, "reported while the authenticator was pending");
+    assertBetween(Date.now() - started, 50, 1500);
+
+    // the authenticator finishing later must not send CONNECT
+    release.resolve();
+    await delay(200);
+    assertEquals(srv.connects.length, 0);
+  } finally {
+    release.resolve();
+    await srv.stop();
+  }
+});
+
+// A non-auth -ERR does not reject connect() and the server here keeps the
+// socket open, so nothing else ends the attempt: only the -ERR handling in
+// push() stops the authenticator's late result from sending a CONNECT into a
+// connection the server has already given up on.
+Deno.test("authenticator - async fn: -ERR ends the attempt, a late resolution sends no CONNECT", async () => {
+  const srv = await errServer("Stale Connection", 100);
+  try {
+    let signed = false;
+    const rejected = assertRejects(() =>
+      connect({
+        port: srv.port,
+        reconnect: false,
+        timeout: 1500,
+        asyncAuthenticator: async () => {
+          await delay(500);
+          signed = true;
+          return { auth_token: "x" };
+        },
+      })
+    );
+    await delay(900);
+    assertEquals(signed, true, "the authenticator did finish");
+    assertEquals(srv.connects.length, 0, "but its result was discarded");
+    // nothing closes this connect(); it ends on the dial timeout
+    await rejected;
+  } finally {
+    await srv.stop();
+  }
+});
+
+Deno.test("authenticator - async fn: real server's Authentication Timeout is reported while the authenticator is still pending", async () => {
+  const ns = await NatsServer.start({
+    authorization: { token: "s3cret", timeout: 1 },
+  });
+  const release = deferred<void>();
+  try {
+    let signed = false;
+    const err = await assertRejects(() =>
+      ns.connect({
+        reconnect: false,
+        asyncAuthenticator: async () => {
+          await release;
+          signed = true;
+          return { auth_token: "s3cret" };
+        },
+      })
+    );
+    assertInstanceOf(err, AuthorizationError);
+    assertEquals(signed, false);
+  } finally {
+    release.resolve();
+    await ns.stop(true);
+  }
 });

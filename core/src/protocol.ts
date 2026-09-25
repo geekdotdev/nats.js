@@ -396,9 +396,10 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   infoReceived: boolean;
   // True only between kicking off options.asyncAuthenticator and this
   // connection's own CONNECT actually being sent. While true, push() drops
-  // every event except the INFO that set it — this connection hasn't
-  // authenticated yet, so nothing the server sends in that window should
-  // be acted on. See ASYNC-AUTHENTICATOR-SCOPE.md.
+  // every event except the INFO that set it and any -ERR (which also ends
+  // the attempt, see push()) — this connection hasn't authenticated yet, so
+  // nothing else the server sends in that window should be acted on. See
+  // ASYNC-AUTHENTICATOR-SCOPE.md.
   awaitingAsyncConnect: boolean;
   // Bumped every time resetOutbound() runs (a fresh dial/reconnect attempt).
   // An in-flight asyncAuthenticator resolution captures the generation it
@@ -966,6 +967,23 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     // what's already driving processInfo/resolution in the first place.
     // Bytes are still parsed upstream in Parser.parse() regardless (parser
     // framing state stays correct) — this only drops the resulting event.
+    //
+    // -ERR is the other exception, and it preempts the pending
+    // authenticator rather than waiting for it. Every -ERR the server can
+    // send before it has seen a CONNECT (Authorization Violation,
+    // Authentication Timeout, Stale Connection, ...) is terminal, and
+    // handling one only records the error and rejects the pending connect —
+    // it writes nothing to the transport — so it is safe to handle at once.
+    // It has to be: dropped, the client couldn't say why the server gave up
+    // until the dial timeout fired. It also ends this attempt: clearing
+    // awaitingAsyncConnect and bumping the generation makes the authenticator's
+    // eventual resolution (or rejection) see it is stale, so it neither sends
+    // a CONNECT nor closes the connection. The authenticator itself is not
+    // cancelled; its result is simply discarded.
+    if (this.awaitingAsyncConnect && e.kind === Kind.ERR) {
+      this.awaitingAsyncConnect = false;
+      this.connectGeneration++;
+    }
     if (this.awaitingAsyncConnect && e.kind !== Kind.INFO) {
       return;
     }
