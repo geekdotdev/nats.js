@@ -30,6 +30,7 @@ import { Kind, Parser } from "./parser.ts";
 import { MsgImpl } from "./msg.ts";
 import { Features, parseSemVer } from "./semver.ts";
 import type {
+  Auth,
   ConnectionOptions,
   Dispatcher,
   Msg,
@@ -50,6 +51,9 @@ import {
   DEFAULT_RECONNECT_TIME_WAIT,
 } from "./options.ts";
 import { errors, InvalidArgumentError } from "./errors.ts";
+import type { AuthResolver } from "./authenticator.ts";
+import { AUTH_RESOLVER, isThenable } from "./authenticator.ts";
+import { HoldQueue } from "./hold_queue.ts";
 
 import type {
   AuthorizationError,
@@ -99,6 +103,7 @@ export class Connect {
     transport: { version: string; lang: string },
     opts: ConnectionOptions,
     nonce?: string,
+    creds?: Auth,
   ) {
     this.protocol = 1;
     this.version = transport.version;
@@ -109,11 +114,14 @@ export class Connect {
     this.tls_required = opts.tls ? true : undefined;
     this.name = opts.name;
 
-    const creds =
+    // creds, when given, were already resolved (asynchronously) by the
+    // caller and replace the call to the authenticator
+    const auth = creds !== undefined ? creds || {} : (
       (opts && typeof opts.authenticator === "function"
         ? opts.authenticator(nonce)
-        : {}) || {};
-    extend(this, creds);
+        : {}) || {}
+    );
+    extend(this, auth);
   }
 }
 
@@ -423,6 +431,14 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
   connectPromise: Promise<void> | null;
   dialDelay: Delay | null;
   raceTimer?: Timeout<void>;
+  // holds the events that arrive after INFO while an asynchronous
+  // authenticator is pending, so they can be replayed after CONNECT. Every
+  // -ERR the server can send before CONNECT is terminal and handling it
+  // writes nothing to the wire, so those are never held: they are handled at
+  // once, which is how the server's explanation gets reported.
+  private readonly connectHold = new HoldQueue<ParserEvent>(
+    (e) => e.kind === Kind.ERR,
+  );
 
   constructor(options: ConnectionOptions, publisher: Publisher) {
     this._closed = false;
@@ -481,6 +497,8 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     });
     this.parser = new Parser(this);
     this.infoReceived = false;
+    // a pending async authenticator belongs to the attempt being replaced
+    this.connectHold.abortFor();
   }
 
   dispatchStatus(status: Status): void {
@@ -862,29 +880,53 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       if (this.transport.isEncrypted()) {
         this.servers.updateTLSName();
       }
-      // send connect
-      const { version, lang } = this.transport;
+      const resolve = (this.options as unknown as Record<symbol, unknown>)[
+        AUTH_RESOLVER
+      ] as AuthResolver | undefined;
+      if (resolve) {
+        // the "update" and "ldm" status run after CONNECT is written, as
+        // they do when the credentials are synchronous
+        this.beginAsyncConnect(
+          info,
+          resolve,
+          () => this.infoTail(updates, info),
+        );
+        return;
+      }
       try {
-        const c = new Connect(
-          { version, lang },
-          this.options,
-          info.nonce,
-        );
-
-        if (info.headers) {
-          c.headers = true;
-          c.no_responders = true;
-        }
-        const cs = JSON.stringify(c);
-        this.transport.send(
-          encode(`CONNECT ${cs}${CR_LF}`),
-        );
-        this.transport.send(PING_CMD);
+        this.sendConnect(info);
       } catch (err) {
         // if we are dying here, this is likely some an authenticator blowing up
         this.close(err as Error).catch();
       }
     }
+    this.infoTail(updates, info);
+  }
+
+  private sendConnect(info: ServerInfo, creds?: Auth): void {
+    const { version, lang } = this.transport;
+    const c = new Connect(
+      { version, lang },
+      this.options,
+      info.nonce,
+      creds,
+    );
+
+    if (info.headers) {
+      c.headers = true;
+      c.no_responders = true;
+    }
+    const cs = JSON.stringify(c);
+    this.transport.send(
+      encode(`CONNECT ${cs}${CR_LF}`),
+    );
+    this.transport.send(PING_CMD);
+  }
+
+  private infoTail(
+    updates: ReturnType<Servers["update"]> | undefined,
+    info: ServerInfo,
+  ): void {
     if (updates) {
       const { added, deleted } = updates;
 
@@ -901,7 +943,72 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
     }
   }
 
+  /**
+   * Resolves the credentials and sends CONNECT. If they are not available
+   * synchronously a hold is started first: everything the server sends before
+   * CONNECT (PINGs, which must be answered only after CONNECT) is held, and
+   * replayed in order once CONNECT is out. The hold is started before this
+   * returns, so it is in place before the parser delivers the next event.
+   */
+  private beginAsyncConnect(
+    info: ServerInfo,
+    resolve: AuthResolver,
+    tail: () => void,
+  ): void {
+    let r: Auth | Promise<Auth>;
+    try {
+      r = resolve(info.nonce);
+    } catch (err) {
+      this.close(err as Error).catch();
+      return;
+    }
+    if (!isThenable<Auth>(r)) {
+      try {
+        this.sendConnect(info, (r || {}) as Auth);
+      } catch (err) {
+        this.close(err as Error).catch();
+        return;
+      }
+      tail();
+      return;
+    }
+    // opened before this returns, so it is in place before the parser
+    // delivers the next event of the same chunk
+    const transport = this.transport;
+    const hold = this.connectHold.hold(transport);
+    Promise.resolve(r).then(
+      (creds) => {
+        if (!hold.current || transport.isClosed) {
+          hold.abort();
+          return;
+        }
+        try {
+          this.sendConnect(info, (creds || {}) as Auth);
+        } catch (err) {
+          hold.abort();
+          this.close(err as Error).catch();
+          return;
+        }
+        tail();
+        hold.release((e) => this.dispatch(e));
+      },
+      (err) => {
+        if (!hold.current) {
+          return;
+        }
+        hold.abort();
+        this.close(err as Error).catch();
+      },
+    );
+  }
+
   push(e: ParserEvent): void {
+    if (!this.connectHold.offer(e)) {
+      this.dispatch(e);
+    }
+  }
+
+  private dispatch(e: ParserEvent): void {
     switch (e.kind) {
       case Kind.MSG: {
         const { msg, data } = e;
@@ -1093,6 +1200,7 @@ export class ProtocolHandler implements Dispatcher<ParserEvent> {
       return;
     }
     this.whyClosed = new Error("close trace").stack || "";
+    this.connectHold.abortFor();
     this.heartbeats.cancel();
     if (this.connectError) {
       this.connectError(err);

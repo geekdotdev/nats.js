@@ -24,6 +24,125 @@ import type {
   UserPass,
 } from "./core.ts";
 
+import { InvalidArgumentError } from "./errors.ts";
+
+/**
+ * Marks a function created by {@link asyncAuthenticator}. The value stored
+ * under this key is the wrapped asynchronous credential source.
+ */
+export const ASYNC_AUTH = Symbol("nats.asyncAuth");
+
+/**
+ * Key under which the parsed connection options carry the credential
+ * resolver, when at least one authenticator is asynchronous. Absent otherwise.
+ */
+export const AUTH_RESOLVER = Symbol("nats.authResolver");
+
+/**
+ * Resolves credentials for one connection attempt. Returns a promise only
+ * when at least one member is asynchronous.
+ */
+export type AuthResolver = (nonce?: string) => Auth | Promise<Auth>;
+
+type AsyncMember = Authenticator & {
+  [ASYNC_AUTH]: (nonce?: string) => Promise<Auth>;
+};
+
+export function isAsyncMember(a: unknown): a is AsyncMember {
+  return typeof a === "function" &&
+    typeof (a as AsyncMember)[ASYNC_AUTH] === "function";
+}
+
+export function isThenable<T>(v: unknown): v is PromiseLike<T> {
+  return v !== null && typeof v === "object" &&
+    typeof (v as PromiseLike<T>).then === "function";
+}
+
+function asyncCalledSync(): InvalidArgumentError {
+  return new InvalidArgumentError(
+    "an asyncAuthenticator cannot be called synchronously - " +
+      "pass it as the 'authenticator' option to connect()",
+  );
+}
+
+/**
+ * Wraps an asynchronous credential source (for example one that signs the
+ * server nonce with a non-extractable WebCrypto key, or fetches a token) so
+ * it can be used anywhere an {@link Authenticator} can: on its own, as an
+ * element of the `authenticator` array, or alongside `token`, `user` and
+ * `pass`. Credentials from all sources are merged in order; later sources
+ * win on conflicting fields.
+ *
+ * The function is invoked once per connection attempt (including every
+ * reconnect), with that attempt's nonce. It must settle before the server
+ * gives up on the connection: the server closes a connection that has not
+ * sent `CONNECT` within its authorization timeout, or after `ping_interval
+ * * (ping_max + 1)`, whichever comes first. A `null` or `undefined` result is
+ * treated as no credentials.
+ *
+ * The returned function must not be called directly: doing so throws.
+ *
+ * @param fn - returns the credentials for the given nonce
+ */
+export function asyncAuthenticator(
+  fn: (nonce?: string) => Promise<Auth>,
+): Authenticator {
+  if (typeof fn !== "function") {
+    throw InvalidArgumentError.format("fn", "must be a function");
+  }
+  const f = (): Auth => {
+    throw asyncCalledSync();
+  };
+  (f as unknown as AsyncMember)[ASYNC_AUTH] = fn;
+  return f;
+}
+
+function mergeInOrder(parts: Auth[]): Auth {
+  let auth: Partial<NoAuth & TokenAuth & UserPass & NKeyAuth & JwtAuth> = {};
+  for (const p of parts) {
+    auth = Object.assign(auth, p || {});
+  }
+  return auth as Auth;
+}
+
+/**
+ * Builds a resolver over the given members, at least one of which is
+ * asynchronous. Sync members run inline, in order; async members are started
+ * concurrently. Merge order is member order, later wins - the same rule as
+ * {@link multiAuthenticator}.
+ */
+export function asyncResolver(members: Authenticator[]): AuthResolver {
+  return (nonce?: string) => {
+    const parts: Array<Auth | Promise<Auth>> = [];
+    try {
+      for (const m of members) {
+        parts.push(isAsyncMember(m) ? m[ASYNC_AUTH](nonce) : m(nonce));
+      }
+    } catch (err) {
+      // a member threw after an async one started: don't leak its rejection
+      parts.forEach((x) => {
+        if (isThenable(x)) {
+          Promise.resolve(x).catch(() => {});
+        }
+      });
+      throw err;
+    }
+    return parts.some((x) => isThenable(x))
+      ? Promise.all(parts).then(mergeInOrder)
+      : mergeInOrder(parts as Auth[]);
+  };
+}
+
+/**
+ * The `authenticator` installed on parsed options when a resolver is
+ * present: keeps the option a function, but fails loudly if used directly.
+ */
+export function asyncOnlyAuthenticator(): Authenticator {
+  return (): Auth => {
+    throw asyncCalledSync();
+  };
+}
+
 export function multiAuthenticator(authenticators: Authenticator[]) {
   return (nonce?: string): Auth => {
     let auth: Partial<NoAuth & TokenAuth & UserPass & NKeyAuth & JwtAuth> = {};

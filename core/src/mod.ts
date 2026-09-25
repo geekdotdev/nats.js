@@ -14,6 +14,7 @@
  */
 
 export {
+  asyncAuthenticator,
   AuthorizationError,
   backoff,
   Bench,

@@ -61,6 +61,7 @@ export {
 } from "./options.ts";
 export { RequestOne } from "./request.ts";
 export {
+  asyncAuthenticator,
   credsAuthenticator,
   jwtAuthenticator,
   nkeyAuthenticator,

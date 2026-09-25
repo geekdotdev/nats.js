@@ -18,6 +18,10 @@ import { defaultPort, getResolveFn } from "./transport.ts";
 import type { Authenticator, ConnectionOptions, ServerInfo } from "./core.ts";
 import { createInbox, DEFAULT_HOST } from "./core.ts";
 import {
+  asyncOnlyAuthenticator,
+  asyncResolver,
+  AUTH_RESOLVER,
+  isAsyncMember,
   multiAuthenticator,
   noAuthFn,
   tokenAuthenticator,
@@ -93,6 +97,30 @@ export function buildAuthenticator(
   return buf.length === 0 ? noAuthFn() : multiAuthenticator(buf);
 }
 
+/**
+ * Returns the resolver for the options' credential sources if any of them is
+ * asynchronous (see asyncAuthenticator), otherwise undefined.
+ */
+function buildAuthResolver(opts: ConnectionOptions) {
+  const buf: Authenticator[] = [];
+  if (typeof opts.authenticator === "function") {
+    buf.push(opts.authenticator);
+  }
+  if (Array.isArray(opts.authenticator)) {
+    buf.push(...opts.authenticator);
+  }
+  if (!buf.some((a) => isAsyncMember(a))) {
+    return undefined;
+  }
+  if (opts.token) {
+    buf.push(tokenAuthenticator(opts.token));
+  }
+  if (opts.user) {
+    buf.push(usernamePasswordAuthenticator(opts.user, opts.pass));
+  }
+  return asyncResolver(buf);
+}
+
 export function parseOptions(opts?: ConnectionOptions): ConnectionOptions {
   const dhp = `${DEFAULT_HOST}:${defaultPort()}`;
   opts = opts || { servers: [dhp] };
@@ -116,7 +144,13 @@ export function parseOptions(opts?: ConnectionOptions): ConnectionOptions {
   }
   const options = extend(defaultOptions(), opts);
 
-  options.authenticator = buildAuthenticator(options);
+  const resolver = buildAuthResolver(options);
+  if (resolver) {
+    (options as unknown as Record<symbol, unknown>)[AUTH_RESOLVER] = resolver;
+    options.authenticator = asyncOnlyAuthenticator();
+  } else {
+    options.authenticator = buildAuthenticator(options);
+  }
 
   ["reconnectDelayHandler", "authenticator"].forEach((n) => {
     if (options[n] && typeof options[n] !== "function") {
