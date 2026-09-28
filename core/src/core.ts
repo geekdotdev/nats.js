@@ -877,6 +877,20 @@ export interface Authenticator {
  * with {@link Authenticator} in practice: if set, it takes precedence for
  * the initial CONNECT, and the existing synchronous {@link Authenticator}
  * path is otherwise unaffected by its presence.
+ *
+ * Unlike a synchronous authenticator, this one is not guaranteed to finish
+ * inside the server's default 2-second Authentication Timeout. Possible
+ * causes (see core/README.md's "AsyncAuthenticator" section):
+ * - a user-presence or biometric gate on the key
+ * - a backgrounded or throttled tab
+ * - a non-local (network-backed) signer
+ * - main-thread contention delaying the continuation
+ * - sleep/wake during the await
+ *
+ * If yours can plausibly take that long, one candidate workaround today is
+ * raising the server's own `authorization { timeout: <seconds> }` — this
+ * interface itself cannot extend that deadline on the client's behalf.
+ *
  * @type function(nonce?: string) => Promise<Auth>
  */
 export interface AsyncAuthenticator {

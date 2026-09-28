@@ -666,6 +666,78 @@ const nc = await connect(
 );
 ```
 
+#### AsyncAuthenticator
+
+For credential schemes that cannot compute their result synchronously — for
+example, signing the connection nonce with a non-extractable WebCrypto key,
+which every browser makes asynchronous by specification — assign an
+`asyncAuthenticator` instead of `authenticator`. It has the same shape as
+`Authenticator`, except it returns `Promise<Auth>`:
+
+```typescript
+asyncAuthenticator?: (nonce?: string) => Promise<Auth>;
+```
+
+When set, it takes precedence over `authenticator` for the initial `CONNECT`.
+
+##### The risk: the server's Authentication Timeout doesn't know it's waiting on a promise
+
+nats-server closes a connection that hasn't sent `CONNECT` within its
+`authorization { timeout: <seconds> }` window. The default is 2 seconds.
+
+A synchronous authenticator can't miss that window — signing with a seed locally
+is CPU-bound math that runs inline, in the same turn that builds `CONNECT`. An
+asynchronous one can, because awaiting its result hands control back to the
+event loop, and nothing guarantees that turn comes back quickly:
+
+- a user-presence or biometric gate on the key
+- a backgrounded or throttled tab
+- a non-local (network-backed) signer
+- main-thread contention delaying the continuation
+- sleep/wake during the await
+
+Each of these can plausibly push a real signing operation past 2 seconds, even
+though the cryptography itself takes microseconds.
+
+**A user-presence or biometric gate on the key.** Some non-extractable key
+backings (platform authenticators, TPM/Secure-Enclave-backed keys with a
+presence requirement) don't just compute when you call `sign()` — they can raise
+a Face ID/fingerprint/PIN prompt and wait on the person. A slow or distracted
+user is real, human-timescale latency the crypto operation itself never has.
+
+**A backgrounded or throttled tab.** Browsers deliberately deprioritize a
+background tab's JS execution to save power. If whatever triggers the reconnect
+fires while the tab holding the key isn't focused, the `sign()` promise can sit
+unresolved long after the operation itself would have finished, for reasons that
+have nothing to do with the cryptography.
+
+**A non-local (network-backed) signer.** `AsyncAuthenticator`'s contract doesn't
+require WebCrypto specifically — a real deployment could back it with a remote
+KMS or HSM call instead. That's now subject to ordinary network latency,
+congestion, DNS, TLS handshake overhead, or a cold-starting signing service,
+none of which local nkey-seed signing is ever exposed to.
+
+**Main-thread contention delaying the continuation.** Even when the underlying
+crypto is fast, a promise only resolves once the event loop gets back around to
+it. A page doing something synchronously heavy elsewhere (a big layout/reflow, a
+large `JSON.parse`, another script hogging the thread) delays when `.then()`
+runs, independent of how fast the signature itself was computed.
+
+**Sleep/wake during the await.** A laptop lid closing and reopening, or an OS
+suspend, while the sign call is in flight — wall-clock time keeps moving on the
+server the entire time, regardless of what the client's JS thinks elapsed.
+
+##### A candidate workaround
+
+If your authenticator can plausibly take longer than a couple of seconds — a
+biometric gate, a remote signer, or a client environment (browser tabs, laptops)
+you don't control the scheduling of — one option today is to raise the server's
+own `authorization { timeout: <seconds> }` accordingly. This interface itself
+has no client-side way to extend that deadline: the server enforces it
+unilaterally from the moment the TCP connection opens, before it has any way to
+know whether the client's authenticator is synchronous or asynchronous, let
+alone how long a particular async one might need.
+
 ### Flush
 
 Flush sends a `PING` protocol message to the server. When the server responds
