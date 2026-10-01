@@ -680,6 +680,24 @@ asyncAuthenticator?: (nonce?: string) => Promise<Auth>;
 
 When set, it takes precedence over `authenticator` for the initial `CONNECT`.
 
+##### Usage
+
+`asyncAuthenticator` exists for the one part of a credential scheme that's
+inherently async: producing a signature with a non-extractable key. Treat it
+as a signing step only, not a place to also fetch or mint the credential
+itself. Obtain/refresh that separately — on load, on a timer, after a token
+exchange — and cache it, so the callback has nothing left to do but sign:
+
+```javascript
+// Kept fresh by a separate refresh cycle, not by this callback.
+let cachedJwt;
+
+const asyncAuthenticator = async (nonce) => {
+  const sig = await crypto.subtle.sign(alg, nonExtractableKey, nonce);
+  return { jwt: cachedJwt, sig };
+};
+```
+
 ##### The risk: the server's Authentication Timeout doesn't know it's waiting on a promise
 
 nats-server closes a connection that hasn't sent `CONNECT` within its
@@ -727,16 +745,38 @@ runs, independent of how fast the signature itself was computed.
 suspend, while the sign call is in flight — wall-clock time keeps moving on the
 server the entire time, regardless of what the client's JS thinks elapsed.
 
+##### Pitfalls
+
+It's tempting to fold the credential fetch into the same callback shown in
+Usage above, rather than keeping it as a separate, cached step:
+
+```javascript
+const asyncAuthenticator = async (nonce) => {
+  // Mints/fetches a credential inline, inside the CONNECT leg — avoid this.
+  const token = await fetch("https://auth.example.com/mint", { ... });
+  const sig = await crypto.subtle.sign(alg, nonExtractableKey, nonce);
+  return { jwt: token.jwt, sig };
+};
+```
+
+This often works in development, which is exactly what makes it a trap: it
+exposes the CONNECT leg to every risk factor described above, stacked on top
+of whatever latency the signing operation itself already adds. The failure is
+intermittent (depends on network conditions at connect time) and surfaces as a
+generic authentication timeout, with nothing pointing back at the
+authenticator as the cause.
+
 ##### A candidate workaround
 
-If your authenticator can plausibly take longer than a couple of seconds — a
-biometric gate, a remote signer, or a client environment (browser tabs, laptops)
-you don't control the scheduling of — one option today is to raise the server's
-own `authorization { timeout: <seconds> }` accordingly. This interface itself
-has no client-side way to extend that deadline: the server enforces it
-unilaterally from the moment the TCP connection opens, before it has any way to
-know whether the client's authenticator is synchronous or asynchronous, let
-alone how long a particular async one might need.
+If your authenticator can plausibly take longer than a couple of seconds even
+with the Usage pattern above — a biometric gate, a remote signer, or a client
+environment (browser tabs, laptops) you don't control the scheduling of — one
+option today is to raise the server's own `authorization { timeout: <seconds>
+}` accordingly. This interface itself has no client-side way to extend that
+deadline: the server enforces it unilaterally from the moment the TCP
+connection opens, before it has any way to know whether the client's
+authenticator is synchronous or asynchronous, let alone how long a particular
+async one might need.
 
 ### Flush
 
